@@ -1,0 +1,1042 @@
+<!DOCTYPE html>
+<html lang='en'>
+  <head>
+    <meta charset='UTF-8'>
+    
+    <meta name='mobile-web-app-capable' content='yes'> 
+    <meta name='apple-mobile-web-app-capable' content='yes'>
+    <meta name='apple-mobile-web-app-status-bar-style' content='black'>  
+    <meta name='apple-mobile-web-app-title' content='Where can I go?'>  <!-- to match title below -->  
+    <meta name='viewport' content='width=device-width, initial-scale=1.0' />
+
+    <title>Where can I go?</title>
+    
+  <!--***********************Explanatory notes**********************************
+  Data notes
+  1.  Public transport information shown in the app is from Public
+      Transport Victoria's API 
+      https://www.data.vic.gov.au/data/dataset/ptv-timetable-api , 
+      which links through to instructions at 
+      http://timetableapi.ptv.vic.gov.au/swagger/ui/index#/
+      
+  Displaying the public transport information
+  2.  The purpose of the app is to show, from a given location, where you can
+      get to in a given time (default: 45 minutes) from a given location, by 
+      a single trip on public transport, setting off at a given time (default:
+      now).  This is achieved as follows.
+      (1) Call to API to find stops within given distance of location. The given
+          distance is determined by the max walking distance (default: 1000m)
+          and set walking speed (default: 5 km/h).
+      (2) For each stop, call to API to find departures within time remaining
+          after allowing for walk to stop.
+      (3) If a stop has departures, display on map.
+      (4) For each departure, call to API to find its arrival points.
+      (5) If arrival time is within time remaining, calculate reachable walking
+          distance (up to max walking distance or, if less, within time
+          remaining).
+      (6) Create buffer for each arrival point, showing the area reachable by
+          walking, and dissolve the buffers using turf.union.
+      (7) Using details saved from the 'arrival points' call, the reachable 
+          buffer from each departure point can also be displayed (as a separate
+          layer) when clicking on the departure point.
+  
+  Script notes
+  3.  The javascript below is organised in the following sections.
+      1.===Declare and initialise global variables
+      2.===Define functions used in script
+         a.===PTV functions
+         b.===General functions
+      3.===Create event handlers
+      4.===Main function to run on document ready
+         a.===Initialise map
+         b.===Initialise map controls
+         c.===Initialise location marker and related events
+         d.===Initialise sidebar items
+         e.===Initialise basemap layer
+         f.===Set running
+     
+  4. Updated in August 2026 as follows:
+      (1) Changed the 'findArrivals' function to use 'run_ref' instead of 'run_id',
+          reflecting a change to the API.
+      (2) Changed the 'findArrivals' function to introduce a queue, to avoid throttle 
+          limit issues when making multiple concurrent arrival requests to the API. Uses a
+          maximum of 1 concurrent request, set by the 'MAX_ARRIVAL_REQUESTS' constant, 
+          which can be changed experimentally - on testing, this works successfully
+          for a peak hour search in central Melbourne (however, central Melbourne is
+          very slow - more because of the volume of data returned and stored than the queue).
+      (3) Introduced a searchId to better handle new searches triggered while an old 
+          search is still in progress, so that old searches are ignored and do not
+          interfere with the new search, and altered location marker to pulse
+          while a search is in progress.
+
+  5. Issues for further consideration
+      (1) VLine stations have multiple identical 'trips' because of being
+          on multiple timetables (eg Ballarat, Ararat, Maryborough) - test 
+          on Rockbank; same can apply to Lilydale/Belgrave.
+      (2) The functions make multiple calls to find the arrivals for each 'run_ref';
+          consider a restructure to only make one call for each run_ref (but requires
+          revising the logic of proceeding sequentially through departure stops,
+          using their respective individual timing).
+      (3) The '1 concurrent request' approach may not be the best way to handle
+          throttle limits, and could be considered further.  Another alternative
+          may be to set a delay between calls. Also, the extent of errors from the
+          '1 concurrent request' approach should continue to be monitored.
+
+
+  ***************************************************************************-->
+    
+    <!-- links to external resources-->
+    <link rel='stylesheet' href='src/leaflet.css'> <!--v1.3.4-->
+    <link rel='stylesheet' href='src/css/bootstrap.min.css'> <!--v4.1.3-->
+    <link rel='stylesheet' href='src/plugins/L.Control.Sidebar.css'> <!--v0.2.0-->
+    <link rel='stylesheet' href='src/plugins/L.Control.Window.css'> <!--v0.0.1-->
+    <link rel='stylesheet' href='src/fontawesome/css/all.min.css'> <!--v5.6.3-->
+    <link rel='stylesheet' href='src/plugins/easy-button.css'> <!--v2.3.0-->
+    <link rel='stylesheet' href='src/plugins/MarkerCluster.css'> <!--v1.4.1-->
+    <link rel='stylesheet' href='src/plugins/MarkerCluster.Default.css'> <!--v1.4.1-->
+    <link rel='stylesheet' href='src/plugins/zebra/zebra_datepicker.min.css'> <!--v1.9.13-->
+    
+    
+    <script src='src/leaflet.js'></script> <!--v1.3.4-->
+    <script src='src/jquery-3.3.1.min.js'></script>
+    <script src='src/plugins/leaflet.ajax.min.js'></script> <!--v2.1.0-->
+    <script src='src/plugins/L.Control.Sidebar.js'></script> <!--v0.2.0-->
+    <script src='src/plugins/L.Control.Window.js'></script> <!--v0.0.1-->
+    <script src='src/plugins/easy-button.js'></script> <!--v2.3.0-->
+    <script src='src/hmac-sha1.js'></script> <!--v3.1.2-->
+    <script src='src/d3.min.js'></script> <!--v5.12.0-->
+    <script src='src/plugins/leaflet.markercluster.js'></script> <!--v1.4.1-->
+    <script src='src/turf.min.js'></script> <!--v5.1.6-->
+    <script src='src/plugins/zebra/zebra_datepicker.min.js'></script> <!--v1.9.13-->
+    
+    
+    <style>
+      #mapdiv {
+        height: 100vh;  /* 100% of viewport height */
+      }
+      
+      .leaflet-sidebar .close {
+        z-index: 1000 /* otherwise, close button doesn't appear */
+      } 
+      
+      .Zebra_DatePicker {
+        z-index: 2000  /* otherwise, appears behind sidebar */
+      }
+      
+      .easy-button-button {
+        padding: 0px;
+        vertical-align: middle; /* ensure easybutton content centred on larger mobile buttons */
+      }
+      
+      .mrkLocationIcon {
+        text-align: center; /* Horizontally centre the text (icon) */
+        line-height: 20px; /* Vertically centre the text (icon) */
+      }
+      
+      .mycluster { /* Tailored cluster appearance to match standard stop appearance */
+        width: 12px;  
+        height: 12px;
+        background-color: green;
+        border-radius: 50%;
+      }
+      
+      .mydot { /* Smaller version of standard stop for legend */
+        width: 10px;  
+        height: 10px;
+        background-color: green;
+        border-radius: 50%;
+        display: inline-block;
+      }
+
+      .mrkLocationSearching { /* Pulsing effect for location marker when searching */
+        animation: locationPulse 0.8s ease-in-out infinite alternate;
+      }
+
+      @keyframes locationPulse { /* Define the pulsing animation */
+        from {
+          transform: scale(1);
+          opacity: 1;
+        }
+        to {
+          transform: scale(1.5);
+          opacity: 0.45;
+        }
+      }
+      
+    </style>
+  </head>
+
+
+  <body>
+    <div id='mapdiv'></div>
+
+    <div id='sidebar'>
+      <h4>Where can I go?</h4>
+      <h6>by public transport in Melbourne</h6>
+      <hr>
+      
+      <form>
+        <div class='form-group'>
+          <label for='datetime'><h6>Departure date and time: </h6></label>
+          <div class='row' style='padding: 0px 12px'>
+            <input type='text' id='datetime' class='datepicker form-control'>
+          </div>
+        </div>
+      </form>
+      <hr>      
+     
+      <div id='howto'>
+        <div id='howtoHeading'>
+          <h6>How to use <span id='howtoArrow' class='fas fa-angle-double-down' style='font-size: small'></span></h6>
+        </div>
+        <div id='howtoContent' style='display: none'>
+          <p>Use <span class='far fa-life-ring fa-lg' style='font-size: small'></span> button to locate, or drag location marker (in Melbourne)</p>
+          <p>Use <span class='fas fa-bolt fa-lg' style='color: blue; font-size: small'></span> button to see where you can go in <span id='howtoMins'>45</span> minutes by a single trip on public transport from nearby stops</p>
+          <p>Click on a nearby stop <span class='mydot'></span> to see its departures</p>
+          <p>Use 'Change trip settings' below to change travel time and other default settings</p>
+        </div>
+      </div>
+      <hr>      
+
+      <div id='change'>
+        <div id='changeHeading'>
+          <h6>Change trip settings <span id='changeArrow' class='fas fa-angle-double-down' style='font-size: small'></span></h6>
+        </div>
+        <div id='changeContent' style='display: none'>
+          <form>
+            <div class='form-group'>
+              <label for='trip-slider'>Maximum trip time: <span id='trip-slider-value'>45</span> minutes</label>
+              <div class='row' style='padding: 0px 12px'>
+                <div class='col-1' style='padding: 0px; text-align: center'>30</div>
+                <div class='col-10' style='padding: 0px'>
+                  <input type='range' class='form-control-range' id='trip-slider' min='30' max='90' step = '5' value='45'>
+                </div>
+                <div class='col-1' style='padding: 0px; text-align: center'>90</div>
+              </div>
+            </div>
+          </form>      
+
+          <form>
+            <div class='form-group'>
+              <label for='walk-slider'>Maximum walking distance: <span id='walk-slider-value'>1000</span> metres</label>
+              <div class='row' style='padding: 0px 12px'>
+                <div class='col-1' style='padding: 0px; text-align: center'>400</div>
+                <div class='col-10' style='padding: 0px'>
+                  <input type='range' class='form-control-range' id='walk-slider' min='400' max='1500' step = '100' value='1000'>
+                </div>
+                <div class='col-1' style='padding: 0px; text-align: center'>1500</div>
+              </div>
+            </div>
+          </form>      
+
+          <form>
+            <div class='form-group'>
+              <label for='speed-slider'>Walking speed: <span id='speed-slider-value'>5</span> km/h</label>
+              <div class='row' style='padding: 0px 12px'>
+                <div class='col-1' style='padding: 0px; text-align: center'>3</div>
+                <div class='col-10' style='padding: 0px'>
+                  <input type='range' class='form-control-range' id='speed-slider' min='3' max='6' step = '0.1' value='5'>
+                </div>
+                <div class='col-1' style='padding: 0px; text-align: center'>6</div>
+              </div>
+            </div>
+          </form>      
+
+          <button id='defaults' class='btn btn-primary btn-block'>Restore defaults</button>
+        </div>
+      </div>
+      <hr>
+      
+      <div id='credits'>
+        <div id='credHeading'>
+          <h6>Credits <span id='credArrow' class='fas fa-angle-double-down' style='font-size: small'></span></h6>
+        </div>
+        <div id='credContent' style='display: none'>
+          <p style='font-size: x-small'>Created by Steve Pemberton with <a href='http://leafletjs.com' title='A JS library for interactive maps' target='_blank'>Leaflet</a>
+          <br>Basemap <span id='credBasemap'></span>
+          <br>Public transport data licensed from <a href='https://discover.data.vic.gov.au/dataset/ptv-timetable-api' target='_blank'>Public Transport Victoria</a> under <a href='http://creativecommons.org/licenses/by/4.0' target='_blank'>CC BY 4.0</a></p> 
+        </div>
+      </div>
+    </div>
+
+   
+    <script>
+      /* 1.===Declare and initialise global variables======================== */
+      var mymap; 
+
+      var ctlSidebar;
+      var ctlSidebarToggle;
+      var ctlZoom;
+      var ctlScale;
+      var ctlLocate;
+      var ctlFind;
+      var ctlFailAlert;
+      
+      var picker;
+      
+      var lyrOSM;
+      
+      var polyReachable;
+      var lyrReachable;
+      var lyrStopClusters;
+      var lyrStopLines;
+      var lyrArrivalLocations;
+      var polyStopArrivals;
+      var lyrStopArrivals;
+      var lyrStopArrivalsArea;
+      
+      var mrkLocation;
+      
+      var setoffTime;
+      
+      var arrivalsByStop = {};
+
+      var arrivalQueue = []; 
+      var arrivalRequestsActive = 0;
+      var MAX_ARRIVAL_REQUESTS = 1;  // maximum number of concurrent arrival requests to avoid throttle limit issues
+      
+      var searchId = 0;
+      var stopsRequestsActive = 0;
+      var departureRequestsActive = 0;
+
+      var formatTime = d3.timeFormat('%-I.%M %p');
+      var formatDate = d3.timeFormat('%a %-d %b %Y %-I.%M %p');
+      var parseDate = d3.timeParse('%a %-d %b %Y %-I.%M %p');
+      
+      
+      var DEFAULTS = [45, 1000, 5];  // defaults for TRIP_TIME, MAX_WALK, WALK_SPEED
+      var TRIP_TIME;  // desired trip time in minutes
+      var MAX_WALK;  // maximum walking distance to stop in metres
+      var WALK_SPEED;  //walking speed in km/h
+      var modeName = {
+        0: 'Train',
+        1: 'Tram',
+        2: 'Bus',
+        3: 'VLine',
+        4: 'Night bus'
+      };
+      
+      var optReachable = {
+        color: 'blue',
+        weight: 1,
+        opacity: 0.5,
+        dashArray: '3, 3',
+        fillcolour: 'blue',
+        fillOpacity: 0.2 
+      };
+      var optStop = {
+        radius: 3,
+        color: 'green',
+        weight: 6,
+        opacity: 0.8
+      };
+      var optStopLine = {
+        color: 'green',
+        weight: 1,
+        dashArray: '4, 2'
+      };
+      var optArrival = {
+        radius: 1,
+        color: 'blue',
+        weight: 3
+      };
+      var optArrivalStop = {
+        radius: 1,
+        color: 'red',
+        weight: 3
+      };
+      var optArrivalArea = {
+        color: 'red',
+        weight: 1,
+        opacity: 0.5,
+        dashArray: '3, 3',
+        fillcolour: 'red',
+        fillOpacity: 0.2 
+      };
+      
+      var BOUNDS = [[-38.6, 144.2], [-37.5, 145.7]];
+      var MAPSTART = [-37, 144];
+      var LOCATIONSTART = [-37.7, 145];
+
+      var URL = 'https://timetableapi.ptv.vic.gov.au';  
+      var version = '/v3/';
+      var devid = 3000968;
+      var key = '68918f00-758a-4e5e-8c04-54eb00e2b77c';
+
+      
+      /* 2.===Define functions used in script================================ */
+      /* a.===PTV functions================================================== */
+      // get signature for PTV API requests
+      // note 'APIquery' must consist of 'path parameters' + '?' + optional: 'query parameters' followed by '&' 
+      function getRequest(APIquery) {
+        var request = version + APIquery;
+        request += 'devid=' + devid;
+        var signature = CryptoJS.HmacSHA1(request, key);
+        request = URL + request + '&signature=' + signature.toString().toUpperCase();
+        return request;
+      }
+      
+      // make API request to find stops within given radius of location, invoke 'findDepartures' for each stop
+      function findStops() {
+        // start a new search, and reset counters/queue for the new search
+        searchId++;
+        var thisSearchId = searchId;
+        arrivalQueue = [];
+        arrivalRequestsActive = 0;
+        departureRequestsActive = 0;
+        stopsRequestsActive = 1;  // 1 indicates that stops request is active
+
+        // add pulsing effect to location marker when searching
+        startLocationSearch();
+
+        var stopQuery = 'stops/location/' + 
+            mrkLocation.getLatLng().lat + ',' + mrkLocation.getLatLng().lng + 
+            '?max_results=100&max_distance=' + MAX_WALK + '&';
+        $.get(getRequest(stopQuery), function(data, status, xhr) {
+          // remove any existing arrivals layers 
+          removeArrivals();
+
+          // create layer to show reachable area
+          if (lyrReachable) {
+            lyrReachable.remove();
+          }
+          lyrReachable = L.featureGroup();
+          polyReachable = turf.circle([mrkLocation.getLatLng().lng, mrkLocation.getLatLng().lat], MAX_WALK, {units: 'meters'});
+          lyrReachable.addLayer(L.geoJSON(polyReachable).setStyle(optReachable)).bringToBack();  // at back, behind stopLayer's popups
+          
+          // create layer to hold stops, clustered where necessary
+          if (lyrStopClusters) {
+            lyrStopClusters.remove();
+          }
+          lyrStopClusters = L.markerClusterGroup({
+            maxClusterRadius: 0, // cluster only appears if stops exactly coincide - no special marking, just spiderification
+            iconCreateFunction: function (cluster) { // tailored cluster marker appearance to match standard stop circleMarker
+              return L.divIcon({ 
+                html: '', 
+                className: 'mycluster', 
+                iconSize: L.point(12, 12) 
+              });
+			      }
+          });
+          
+          // create layer to hold lines to stops
+          if (lyrStopLines) {
+            lyrStopLines.remove();
+          }
+          lyrStopLines = L.featureGroup();
+          
+          // create layer to hold arrival locations
+          if (lyrArrivalLocations) {
+            lyrArrivalLocations.remove();
+          }
+          lyrArrivalLocations = L.featureGroup();
+          
+          // fix set off time
+          setoffTime = getTime();
+          
+          // create empty object to hold arrivals by stop
+          arrivalsByStop = {};
+          
+          // cycle through stops, and find departures for each, populating  the stop and line layers
+          for (i=0; i<data.stops.length; i++) {
+            arrivalsByStop[data.stops[i]['stop_id']] = [];  // adds empty array to hold arrivals for the stop
+            findDepartures(lyrStopClusters, lyrStopLines, lyrArrivalLocations, data.stops[i], setoffTime, thisSearchId);
+          }
+          
+          // add reachable, stop, stopline and arrivals layers to map
+          lyrReachable.setStyle(optReachable).addTo(mymap);
+          lyrStopLines.addTo(mymap);
+          lyrArrivalLocations.addTo(mymap);
+          lyrStopClusters.addTo(mymap);
+        })
+          .fail(failAlert)  // provide for alert if API request fails
+          .always(function() {
+            if (thisSearchId === searchId) { // only decrement if this is the most recent search
+              stopsRequestsActive = 0;
+              checkSearchFinished();
+            }
+          });
+      }
+
+      // make API request to find departures for given stop, draw stops and connecting lines, invoke 'findArrivals' for each
+      function findDepartures(stopLayer, stopLinesLayer, arrivalsLayer, stopData, queryTime, thisSearchId) {
+        
+        var departureQuery = 'departures/route_type/' + stopData['route_type'] + 
+            '/stop/' + stopData['stop_id'] + 
+            '?date_utc=' + queryTime + '&max_results=50&expand=all&';  //if don't use all - need list - use %5B=[ %2C=,  %5D=] (from Swagger)
+        
+        departureRequestsActive++;
+        
+        $.get(getRequest(departureQuery), function(data, status, xhr) { 
+
+          // ignore if this is not the most recent search
+          if (thisSearchId !== searchId) {
+            return;
+          }
+
+          // create stop and its details if the stop has departures
+          if (data.departures.length > 0) {
+            // find distance and time to stop
+            var location = [stopData['stop_latitude'], stopData['stop_longitude']]
+            var distance = mymap.distance(mrkLocation.getLatLng(), location);
+            var timeToStop = (distance * 60) / (WALK_SPEED * 1000);
+            
+            // review departures, build up string of those within timeframe, and find their arrival points
+            var departureString = '';
+            for (i=0; i<data.departures.length; i++) {
+              var scheduledTime = d3.isoParse(data['departures'][i]['scheduled_departure_utc']);
+              // if scheduled departure time is after query time plus walking time to stop, and before max trip time
+              if (scheduledTime > d3.timeMinute.offset(d3.isoParse(queryTime), timeToStop) &&
+                 scheduledTime < d3.timeMinute.offset(d3.isoParse(queryTime), TRIP_TIME)) {
+                // create the departure string, beginning with departure time
+                departureString += formatTime(scheduledTime);
+                // for tram and bus, add route number, if any [eg not skybus], from 'routes' (obtained using expand=all)
+                if (stopData['route_type'] == 1 || stopData['route_type'] == 2 ) {
+                  if (data['routes'][data['departures'][i]['route_id']]['route_number']) {
+                    departureString += ' route ' + data['routes'][data['departures'][i]['route_id']]['route_number'];
+                  }
+                }  
+                // add destination, from 'directions' (obtained using expand=all)
+                departureString += ' ' + data['directions'][data['departures'][i]['direction_id']]['direction_name'] + '<br>'; 
+                
+                // find arrivals
+                 findArrivals(arrivalsLayer, data['departures'][i], stopData['route_type'], queryTime, thisSearchId);
+              }
+            }
+            
+            // if departures are found within the timeframe, proceed to create the stop
+            if (departureString.length > 0) {
+            // create circle marker for the stop
+              var stop = L.circleMarker(location, optStop);
+
+              // create popup and click event, and add stop to layer
+              stop.bindPopup('<strong>' + modeName[stopData['route_type']] + '</strong><br>' +
+                             stopData['stop_name'] + '<br>' +
+                             'Distance ' + Math.round(distance) + 'm <br><br>' + 
+                             '<strong>Departures </strong><br>' + departureString);
+ 
+              stop.on('click', function(e) {showStopArrivals(e, stopData['stop_id'])});
+
+              stopLayer.addLayer(stop);
+
+              // create dashed line from location marker to the stop, and add to layer 
+              var stopline = L.polyline([mrkLocation.getLatLng(), stop.getLatLng()], optStopLine);
+              stopLinesLayer.addLayer(stopline).bringToBack();  // at back, so behind stopLayer's popups
+            }
+          }
+        })
+          .fail(failAlert)  // provide for alert if API request fails
+          .always(function() {
+            if (thisSearchId === searchId) { // only decrement if this is the most recent search
+              departureRequestsActive--;
+              checkSearchFinished();
+            }
+          });
+      }
+
+      // add an arrival request to the queue
+      function findArrivals(arrivalsLayer, departureData, routeType, queryTime, thisSearchId) {
+        arrivalQueue.push({
+          arrivalsLayer: arrivalsLayer,
+          departureData: departureData,
+          routeType: routeType,
+          queryTime: queryTime,
+          searchId: thisSearchId
+        });
+
+        processArrivalQueue();
+      }
+
+      // process arrival requests, subject to maximum concurrency:
+      // make API request to find arrivals for a given departure, and draw arrival points
+      function processArrivalQueue() {
+        while (arrivalRequestsActive < MAX_ARRIVAL_REQUESTS && arrivalQueue.length > 0) {
+          var request = arrivalQueue.shift();
+
+          // ignore requests belonging to an old search
+          if (request.searchId !== searchId) {
+            continue;
+          } 
+
+          arrivalRequestsActive++;
+
+          var arrivalQuery = 'pattern/run/' + request.departureData['run_ref'] + // 'run_id' changed to 'run_ref'
+              '/route_type/' + request.routeType +
+              '?date_utc=' + request.queryTime + '&expand=stop&';
+
+          var departureTime = d3.isoParse(
+            request.departureData['scheduled_departure_utc']
+          );
+
+          $.get(getRequest(arrivalQuery), function(data, status, xhr) {
+
+            // ignore response if this belongs to an old search
+            if (request.searchId !== searchId) {
+              return;
+            }
+
+            try { // catch block to handle any errors in processing the data, so that the queue can continue
+
+              for (i=0; i<data.departures.length; i++) {
+                var arrivalTime = d3.isoParse(
+                  data['departures'][i]['scheduled_departure_utc']
+                );
+
+                var endTime = d3.timeMinute.offset(
+                  d3.isoParse(request.queryTime),
+                  TRIP_TIME
+                );
+
+                // if arrival time is after departure time, but before max trip time
+                if (arrivalTime > departureTime &&
+                    arrivalTime < endTime) {
+
+                  // create circle marker for the arrival point,
+                  // and add to arrivals layer
+                  var arrival = L.circleMarker(
+                    [
+                      data['stops'][data['departures'][i]['stop_id']]['stop_latitude'],
+                      data['stops'][data['departures'][i]['stop_id']]['stop_longitude']
+                    ],
+                    optArrival
+                  );
+
+                  request.arrivalsLayer.addLayer(arrival).bringToBack();
+
+                  // add arrival buffer to reachable layer
+                  var minsRemaining = Math.floor(
+                    (endTime - arrivalTime) / 60000
+                  );  // time diff (milliseconds -> mins), round down
+
+                  if (minsRemaining > 0) {
+                    var distance = Math.min(
+                      (minsRemaining * WALK_SPEED * 1000) / 60,
+                      MAX_WALK
+                    );
+
+                    var polyArrival = turf.circle(
+                      [arrival.getLatLng().lng, arrival.getLatLng().lat],
+                      distance,
+                      {units: 'meters'}
+                    );
+
+                    polyReachable = turf.union(polyReachable, polyArrival);
+
+                    lyrReachable.clearLayers();
+
+                    lyrReachable
+                      .addLayer(
+                        L.geoJSON(polyReachable).setStyle(optReachable)
+                      )
+                      .bringToBack();
+
+                    // add details to arrival by stop object
+                    arrivalsByStop[request.departureData['stop_id']].push([
+                      data['stops'][data['departures'][i]['stop_id']]['stop_latitude'],
+                      data['stops'][data['departures'][i]['stop_id']]['stop_longitude'],
+                      distance
+                    ]);
+                  }
+                }
+              }
+            } catch (error) {
+              console.error('Error processing arrival request:', error);
+            }
+
+          })
+            .fail(failAlert)
+            .always(function() {
+              if (request.searchId === searchId) {
+                arrivalRequestsActive--;
+                processArrivalQueue();
+                checkSearchFinished();
+              }
+            });
+        }
+      }
+      
+      // draw arrival stops and area for a given departure stop
+      function showStopArrivals(e, stop_id) {
+        // create layers to hold arrival stops and their area
+        if (lyrStopArrivals) {
+          lyrStopArrivals.remove();
+        }
+        lyrStopArrivals = L.featureGroup();
+
+        if (lyrStopArrivalsArea) {
+          lyrStopArrivalsArea.remove();
+        }
+        lyrStopArrivalsArea = L.featureGroup();
+        
+        // create and add arrival stops and area
+        var departureStop = L.circleMarker(e.latlng, optArrivalStop);
+        lyrStopArrivals.addLayer(departureStop);
+        
+        polyStopArrivals = turf.circle([e.latlng.lng, e.latlng.lat], 
+                                       MAX_WALK, {units: 'meters'}); //this means you walk to stop, then walk again
+
+        for (i=0; i<arrivalsByStop[stop_id].length; i++) {
+          var arrivalStop = L.circleMarker([arrivalsByStop[stop_id][i][0], arrivalsByStop[stop_id][i][1]], 
+                                           optArrivalStop);
+          lyrStopArrivals.addLayer(arrivalStop);
+
+          var arrivalCircle = turf.circle([arrivalsByStop[stop_id][i][1], arrivalsByStop[stop_id][i][0]], 
+                                        arrivalsByStop[stop_id][i][2], {units: 'meters'});
+          polyStopArrivals = turf.union(polyStopArrivals, arrivalCircle);
+        }
+        lyrStopArrivalsArea.addLayer(L.geoJSON(polyStopArrivals).setStyle(optArrivalArea));  
+        lyrStopArrivalsArea.addTo(mymap);
+        lyrStopArrivals.addTo(mymap);
+      }
+
+      // show failure message on API request error'get' failure, using modal
+      function failAlert() {
+        if (!ctlFailAlert.visible) { // only show message if not already visible
+          ctlFailAlert.show();
+          setTimeout(function() { // disappear after fixed time
+            ctlFailAlert.hide()
+          }, 1000);
+        }
+      }
+
+      // check whether search is finished (ie all departure and arrival requests completed),
+      // and if so, remove pulsing effect from location marker
+      function checkSearchFinished() {
+        if (stopsRequestsActive === 0 &&
+            departureRequestsActive === 0 &&
+            arrivalRequestsActive === 0 &&
+            arrivalQueue.length === 0) {
+          finishLocationSearch(); 
+        }
+      }
+      
+      /* b.===General functions============================================== */
+      // return date & time from datepicker, or else current
+      function getTime() {
+        if ($('#datetime').val()) {
+          return parseDate($('#datetime').val()).toISOString();
+        } else {
+        return new Date().toISOString();
+        }
+      }
+      
+      // remove any existing stop arrivals layers 
+      function removeArrivals() {
+        if (lyrStopArrivals) {
+          lyrStopArrivals.remove();
+        }
+        if (lyrStopArrivalsArea) {
+          lyrStopArrivalsArea.remove();
+        }
+      }
+      
+      // test whether iPhone (to address iPhone safari menu bug)
+      function isiPhone() {
+        if (/iPhone/i.test(navigator.userAgent)) {
+          return true;
+        } else {
+          return false;
+        }
+      }
+
+      // add/remove pulsing effect to location marker when searching
+      function startLocationSearch() {
+        $('.mrkLocationIcon i').addClass('mrkLocationSearching');
+      }
+
+      function finishLocationSearch() {
+        $('.mrkLocationIcon i').removeClass('mrkLocationSearching');
+      }
+      
+      
+      /* 3.===Create event handlers========================================== */
+      // howto heading: open and close howto content 
+      $('#howtoHeading').click(function() {
+        if ($('#howtoContent').css('display') == 'none') {
+          $('#howtoContent').css('display', 'block');
+          $('#howtoArrow').removeClass('fas fa-angle-double-down');
+          $('#howtoArrow').addClass('fas fa-angle-double-up');
+        } else {
+          $('#howtoContent').css('display', 'none');
+          $('#howtoArrow').removeClass('fas fa-angle-double-up');
+          $('#howtoArrow').addClass('fas fa-angle-double-down');
+        }
+      });
+
+      // change heading: open and close change content 
+      $('#changeHeading').click(function() {
+        if ($('#changeContent').css('display') == 'none') {
+          $('#changeContent').css('display', 'block');
+          $('#changeArrow').removeClass('fas fa-angle-double-down');
+          $('#changeArrow').addClass('fas fa-angle-double-up');
+        } else {
+          $('#changeContent').css('display', 'none');
+          $('#changeArrow').removeClass('fas fa-angle-double-up');
+          $('#changeArrow').addClass('fas fa-angle-double-down');
+        }
+      });
+
+      // trip slider: set maximum trip time
+      $('#trip-slider').on('input', function() {
+        TRIP_TIME = Number($('#trip-slider').val());
+        $('#trip-slider-value').html($('#trip-slider').val());
+        $('#howtoMins').html($('#trip-slider').val());
+        localStorage.setItem('trip-slider-value', ($('#trip-slider').val()).toString());
+      });
+      
+      // walk slider: set maximum walk time
+      $('#walk-slider').on('input', function() {
+        MAX_WALK = Number($('#walk-slider').val());
+        $('#walk-slider-value').html($('#walk-slider').val());
+        localStorage.setItem('walk-slider-value', ($('#walk-slider').val()).toString());
+      });
+      
+      // speed slider: set walking speed
+      $('#speed-slider').on('input', function() {
+        WALK_SPEED = Number($('#speed-slider').val());
+        $('#speed-slider-value').html($('#speed-slider').val());
+        localStorage.setItem('speed-slider-value', ($('#speed-slider').val()).toString());
+      });
+      
+      // defaults button: restore default parameters
+      $('#defaults').click(function() {
+        TRIP_TIME = DEFAULTS[0];  
+        $('#trip-slider').val(DEFAULTS[0]);
+        $('#trip-slider-value').html(DEFAULTS[0]);
+        $('#howtoMins').html(DEFAULTS[0]);
+        localStorage.setItem('trip-slider-value', DEFAULTS[0].toString());
+        
+        MAX_WALK = DEFAULTS[1];  
+        $('#walk-slider').val(DEFAULTS[1]);
+        $('#walk-slider-value').html(DEFAULTS[1]);
+        localStorage.setItem('walk-slider-value', DEFAULTS[1].toString());
+        
+        WALK_SPEED = DEFAULTS[2];  
+        $('#speed-slider').val(DEFAULTS[2]);
+        $('#speed-slider-value').html(DEFAULTS[2]);
+        localStorage.setItem('speed-slider-value', DEFAULTS[2].toString());
+      });
+      
+      // credit heading: open and close credit content 
+      $('#credHeading').click(function() {
+        if ($('#credContent').css('display') == 'none') {
+          $('#credContent').css('display', 'block');
+          $('#credArrow').removeClass('fas fa-angle-double-down');
+          $('#credArrow').addClass('fas fa-angle-double-up');
+        } else {
+          $('#credContent').css('display', 'none');
+          $('#credArrow').removeClass('fas fa-angle-double-up');
+          $('#credArrow').addClass('fas fa-angle-double-down');
+        }
+      });
+      
+      
+      /* 4.===Main function to run on document ready========================= */
+      $(document).ready(function() {
+        
+        /* a.===Initialise map=============================================== */
+        mymap = L.map('mapdiv', {
+          center: MAPSTART,
+          zoom: 8,
+          zoomControl: false,
+          attributionControl: false
+        });
+        
+        // on any click, remove any arrivals layers
+        mymap.on ('click', removeArrivals);
+   
+        // attempted solution for ios safari menu bar bug
+        if (isiPhone()) {  
+          $('#mapdiv').css('height', '101vh'); 
+          setTimeout(function() {
+            window.scrollTo(0, 1);
+          }, 500);
+          $(window).on('orientationchange', function() {
+            setTimeout(function() {
+              window.scrollTo(0, 1);
+            }, 500);
+          });
+        };
+
+        
+        /* b.===Initialise map controls====================================== */
+        ctlSidebar = L.control.sidebar('sidebar')
+          .addTo(mymap);
+         
+        ctlSidebarToggle = L.easyButton({
+          states: [{
+            stateName: 'sidebar-closed',
+            icon: 'fa-angle-double-right',
+            title: 'Open sidebar',
+            onClick: function(control) {
+              ctlSidebar.show();
+              control.state('sidebar-open');
+            }
+          }, {
+            stateName: 'sidebar-open',
+            icon: 'fa-angle-double-left',
+            title: 'Close sidebar',
+            onClick: function(control) {
+              ctlSidebar.hide();
+              control.state('sidebar-closed');
+            }
+          }],
+          position: 'topleft'
+        })
+          .addTo(mymap);  
+        
+        ctlZoom = L.control.zoom({position: 'topleft'})
+          .addTo(mymap);
+        
+        ctlScale = L.control.scale({
+          position: 'bottomleft',
+          imperial: false,
+          maxWidth: 200
+        })
+          .addTo(mymap);
+        
+        ctlLocate = L.easyButton({
+          states:[{
+            icon: 'far fa-life-ring fa-lg',
+            title: 'Locate',  
+            onClick: function() {
+              mymap.locate();
+            }
+          }],
+          position: 'topright'
+        })
+          .addTo(mymap);
+        
+        ctlFind = L.easyButton({
+          states:[{
+            icon: '<i class="fas fa-bolt fa-lg" style="color: blue"></i>',
+            title: 'Where can I go',  //change?
+            onClick: function() {
+              findStops();
+            }
+          }],
+          position: 'topright'
+        })
+          .addTo(mymap);
+        
+        // modal to show message on 'get' failure, triggered by failAlert() function
+        ctlFailAlert = L.control.window(mymap, {
+          content: 'Unable to retrieve data, sorry'          
+        });
+        
+        
+        /* c.===Initialise location marker and related events================ */
+        mrkLocation = L.marker([], {
+          icon: L.divIcon({
+            html: '<i class="far fa-life-ring fa-spin" style="color: blue; font-size: 20px"></i>',
+            iconSize: [20, 20],
+            className: 'mrkLocationIcon'
+          }),
+          draggable: true
+        });
+
+        // add a dragend event to store any new location, constrained within Melbourne fixed bounds
+        mrkLocation.on('dragend', function(e) {
+          $('.mrkLocationIcon').html('<i class="far fa-life-ring fa-spin" style="color: purple; font-size: 20px"></i>');
+          var lat = Math.min(Math.max(BOUNDS[0][0], e.target.getLatLng().lat), BOUNDS[1][0]);
+          var lng = Math.min(Math.max(BOUNDS[0][1], e.target.getLatLng().lng), BOUNDS[1][1]);
+          localStorage.setItem('lastLocationLat', lat);
+          localStorage.setItem('lastLocationLng', lng);
+          mrkLocation.setLatLng([lat, lng]);
+        });
+
+       // if location found - place marker, and store, or go to LOCATIONSTART if outside Melbourne fixed bounds
+        mymap.on('locationfound', function(e) {
+          if (L.latLngBounds(BOUNDS).contains(e.latlng)) {
+            var lat = e.latlng.lat;
+            var lng = e.latlng.lng;
+          } else {
+            var lat = LOCATIONSTART[0];
+            var lng = LOCATIONSTART[1];
+          }
+          mrkLocation.setLatLng([lat, lng]);
+          mymap.setView([lat, lng], 12);
+          $('.mrkLocationIcon').html('<i class="far fa-life-ring fa-spin" style="color: blue; font-size: 20px"></i>');
+          localStorage.setItem('lastLocationLat', lat);
+          localStorage.setItem('lastLocationLng', lng);
+          if (!mymap.hasLayer(mrkLocation)) {
+            mrkLocation.addTo(mymap);
+          }
+        });
+        
+        // if location not found - place marker at last stored, or (if none) at representative location and store
+        mymap.on('locationerror', function() {
+          if (localStorage.getItem('lastLocationLat') && localStorage.getItem('lastLocationLng')) {
+            mrkLocation.setLatLng([localStorage.getItem('lastLocationLat'), localStorage.getItem('lastLocationLng')]);
+            mymap.setView(mrkLocation.getLatLng(), 12);
+          } else {
+            mrkLocation.setLatLng(LOCATIONSTART);
+            localStorage.setItem('lastLocationLat', mrkLocation.getLatLng().lat);
+            localStorage.setItem('lastLocationLng', mrkLocation.getLatLng().lng);
+          }
+          $('.mrkLocationIcon').html('<i class="far fa-life-ring fa-spin" style="color: purple; font-size: 20px"></i>');
+          if (!mymap.hasLayer(mrkLocation)) {
+            mrkLocation.addTo(mymap);
+          }
+        });
+        
+
+        /* d.===Initialise sidebar items===================================== */
+        $('#datetime').Zebra_DatePicker({
+          format: 'D j M Y g.i A',
+          direction: [true, 14]  // 14 days from today
+        });
+        $('#datetime').val(formatDate(new Date()));
+        
+        if (localStorage.getItem('trip-slider-value')) {
+          TRIP_TIME = Number(localStorage.getItem('trip-slider-value'));
+          $('#trip-slider').val(Number(localStorage.getItem('trip-slider-value')));
+          $('#trip-slider-value').html(localStorage.getItem('trip-slider-value'));
+          $('#howtoMins').html(localStorage.getItem('trip-slider-value'));
+        } else {
+          TRIP_TIME = DEFAULTS[0];
+        };
+  
+        if (localStorage.getItem('walk-slider-value')) {
+          MAX_WALK = Number(localStorage.getItem('walk-slider-value'));
+          $('#walk-slider').val(Number(localStorage.getItem('walk-slider-value')));
+          $('#walk-slider-value').html(localStorage.getItem('walk-slider-value'));
+        } else {
+          MAX_WALK = DEFAULTS[1];
+        };
+  
+        if (localStorage.getItem('speed-slider-value')) {
+          WALK_SPEED = Number(localStorage.getItem('speed-slider-value'));
+          $('#speed-slider').val(Number(localStorage.getItem('speed-slider-value')));
+          $('#speed-slider-value').html(localStorage.getItem('speed-slider-value'));
+        } else {
+          WALK_SPEED = DEFAULTS[2];
+        };
+  
+        if (localStorage.getItem('slider-value')) {
+          $('#slider').val(Number(localStorage.getItem('slider-value')));
+          $('#slider-value').html(localStorage.getItem('slider-value'));
+        };
+  
+        // link state of sidebarToggle to use of sidebar 'close' button
+        $('.leaflet-sidebar .close').click(function() {
+          ctlSidebarToggle.state('sidebar-closed');
+        });
+
+
+        /* e.===Initialise basemap layer===================================== */
+        lyrOSM = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+          attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank">OpenStreetMap</a> contributors'
+        });
+        mymap.addLayer(lyrOSM);
+        $('#credBasemap').html(lyrOSM.getAttribution());
+
+        
+        /* f.===Set running================================================== */
+        mymap.locate();
+        
+      }); //end of doc ready function
+      
+    </script>
+  </body>
+</html>
